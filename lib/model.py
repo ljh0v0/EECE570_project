@@ -5,6 +5,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 
 def swish(input):
@@ -127,32 +128,81 @@ class ResBlock(nn.Module):
         return out + input
 
 
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
 class SelfAttention(nn.Module):
-    def __init__(self, in_channel):
+    """
+    An attention block that allows spatial positions to attend to each other.
+    Originally ported from here, but adapted to the N-d case.
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    """
+
+    def __init__(self, channels, n_head=1):
         super().__init__()
+        self.channels = channels
+        self.num_heads = n_head
 
-        self.norm = nn.GroupNorm(32, in_channel)
-        self.qkv = conv2d(in_channel, in_channel * 3, 1)
-        self.out = conv2d(in_channel, in_channel, 1, scale=1e-10)
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.attention = QKVAttention()
+        self.proj_out = zero_module(nn.Conv1d(channels, channels, 1))
 
-    def forward(self, input):
-        batch, channel, height, width = input.shape
+    def forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        qkv = qkv.reshape(b * self.num_heads, -1, qkv.shape[2])
+        h = self.attention(qkv)
+        h = h.reshape(b, -1, h.shape[-1])
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
 
-        norm = self.norm(input)
-        qkv = self.qkv(norm)
-        query, key, value = qkv.chunk(3, dim=1)
 
-        attn = torch.einsum("nchw, ncyx -> nhwyx", query, key).contiguous() / math.sqrt(
-            channel
-        )
-        attn = attn.view(batch, height, width, -1)
-        attn = torch.softmax(attn, -1)
-        attn = attn.view(batch, height, width, height, width)
+class QKVAttention(nn.Module):
+    """
+    A module which performs QKV attention.
+    """
 
-        out = torch.einsum("nhwyx, ncyx -> nchw", attn, input).contiguous()
-        out = self.out(out)
+    def forward(self, qkv):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (C * 3) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x C x T] tensor after attention.
+        """
+        ch = qkv.shape[1] // 3
+        q, k, v = torch.split(qkv, ch, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts", q * scale, k * scale
+        )  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        return torch.einsum("bts,bcs->bct", weight, v)
 
-        return out + input
+    @staticmethod
+    def count_flops(model, _x, y):
+        """
+        A counter for the `thop` package to count the operations in an
+        attention operation.
+        Meant to be used like:
+            macs, params = thop.profile(
+                model,
+                inputs=(inputs, timestamps),
+                custom_ops={QKVAttention: QKVAttention.count_flops},
+            )
+        """
+        b, c, *spatial = y[0].shape
+        num_spatial = int(np.prod(spatial))
+        # We perform two matmuls with the same number of ops.
+        # The first computes the weight matrix, the second computes
+        # the combination of the value vectors.
+        matmul_ops = 2 * b * (num_spatial ** 2) * c
+        model.total_ops += torch.DoubleTensor([matmul_ops])
 
 
 class TimeEmbedding(nn.Module):
@@ -234,6 +284,7 @@ class UNet(nn.Module):
         attn_strides,
         dropout=0,
         fold=1,
+        img_size=32,
     ):
         super().__init__()
 
@@ -253,6 +304,7 @@ class UNet(nn.Module):
         down_layers   = [conv2d(in_channel * (fold ** 2), channel, 3, padding=1)]
         feat_channels = [channel]
         in_channel    = channel
+        ds = img_size
         for i in range(n_block):
             for _ in range(n_res_blocks):
                 channel_mult = channel * channel_multiplier[i]
@@ -263,7 +315,7 @@ class UNet(nn.Module):
                         channel_mult,
                         time_dim,
                         dropout,
-                        use_attention=2 ** i in attn_strides,
+                        use_attention=ds in attn_strides,
                     )
                 )
 
@@ -273,6 +325,7 @@ class UNet(nn.Module):
             if i != n_block - 1:
                 down_layers.append(Downsample(in_channel))
                 feat_channels.append(in_channel)
+                ds //= 2
 
         self.down = nn.ModuleList(down_layers)
 
@@ -302,7 +355,7 @@ class UNet(nn.Module):
                         channel_mult,
                         time_dim,
                         dropout=dropout,
-                        use_attention=2 ** i in attn_strides,
+                        use_attention=ds in attn_strides,
                     )
                 )
 
@@ -310,6 +363,7 @@ class UNet(nn.Module):
 
             if i != 0:
                 up_layers.append(Upsample(in_channel))
+                ds *= 2
 
         self.up = nn.ModuleList(up_layers)
 
@@ -319,7 +373,12 @@ class UNet(nn.Module):
             conv2d(in_channel, 3 * (fold ** 2), 3, padding=1, scale=1e-10),
         )
 
-    def forward(self, input, time):
+    def forward(self, input, time, cond=None):
+        if cond is not None:
+            if cond.shape != input.shape:
+                cond = F.interpolate(cond, size=input.shape[-2:], mode='bilinear',
+                                     align_corners=False)
+            input = torch.cat((input, cond), dim=1)
         time_embed = self.time(time)
 
         feats = []

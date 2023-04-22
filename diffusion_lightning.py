@@ -3,6 +3,7 @@ import json
 import argparse
 import torch
 from PIL import Image
+import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
@@ -36,12 +37,13 @@ def accumulate(model1, model2, decay=0.9999):
         par1[k].data.mul_(decay).add_(par2[k].data, alpha=1 - decay)
 
 
-def samples_fn(model, diffusion, shape):
+def samples_fn(model, diffusion, shape, cond=None):
     samples = diffusion.p_sample_loop(model=model,
                                       shape=shape,
-                                      noise_fn=torch.randn)
+                                      noise_fn=torch.randn,
+                                      cond=cond)
     return {
-      'samples': (samples + 1)/2
+      'samples': samples
     }
 
 
@@ -53,7 +55,7 @@ def progressive_samples_fn(model, diffusion, shape, device, include_x0_pred_freq
         device=device,
         include_x0_pred_freq=include_x0_pred_freq
     )
-    return {'samples': (samples + 1)/2, 'progressive_samples': (progressive_samples + 1)/2}
+    return {'samples': samples, 'progressive_samples': progressive_samples}
 
 
 def bpd_fn(model, diffusion, x):
@@ -92,6 +94,11 @@ class DDP(pl.LightningModule):
         self.conf  = conf
         self.exp_dir = exp_dir
         self.save_hyperparameters()
+        self.n_timesteps = self.conf.model.schedule.n_timestep
+
+        # Disable automatic optimization
+        self.automatic_optimization = False
+        self.grad_clip_val = conf.training.grad_clip_val
 
         self.model = UNet(self.conf.model.in_channel,
                           self.conf.model.channel,
@@ -100,6 +107,7 @@ class DDP(pl.LightningModule):
                           attn_strides=self.conf.model.attn_strides,
                           dropout=self.conf.model.dropout,
                           fold=self.conf.model.fold,
+                          img_size=self.conf.dataset.resolution,
                           )
 
         self.ema   = UNet(self.conf.model.in_channel,
@@ -109,6 +117,7 @@ class DDP(pl.LightningModule):
                           attn_strides=self.conf.model.attn_strides,
                           dropout=self.conf.model.dropout,
                           fold=self.conf.model.fold,
+                          img_size=self.conf.dataset.resolution,
                           )
 
         self.betas = make_beta_schedule(schedule=self.conf.model.schedule.type,
@@ -138,13 +147,41 @@ class DDP(pl.LightningModule):
         else:
             raise NotImplementedError
 
-        return optimizer
+        # Define the LR scheduler (As in Ho et al.)
+        if self.conf.training.n_anneal_steps == 0:
+            lr_lambda = lambda step: 1.0
+        else:
+            lr_lambda = lambda step: min(step / self.conf.training.n_anneal_steps, 1.0)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "strict": False,
+            },
+        }
 
     def training_step(self, batch, batch_nb):
+        # Optimizers
+        optim = self.optimizers()
+        lr_sched = self.lr_schedulers()
 
         img, _ = batch
-        time   = (torch.rand(img.shape[0]) * 1000).type(torch.int64).to(img.device)
-        loss   = self.diffusion.training_losses(self.model, img, time).mean()
+        time   = (torch.rand(img.shape[0]) * self.n_timesteps).type(torch.int64).to(img.device)
+        cond = F.interpolate(img, size=(16, 16), mode='area')
+        loss   = self.diffusion.training_losses(self.model, img, time, cond=cond).mean()
+
+        # Clip gradients and Optimize
+        optim.zero_grad()
+        self.manual_backward(loss)
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.grad_clip_val
+        )
+        optim.step()
+
+        # Scheduler step
+        lr_sched.step()
 
         accumulate(self.ema, self.model.module if isinstance(self.model, nn.DataParallel) else self.model, 0.9999)
 
@@ -155,6 +192,18 @@ class DDP(pl.LightningModule):
             filename = f"checkpoint_{self.global_step}.ckpt"
             ckpt_path = os.path.join(self.exp_dir, "retain-checkpoint", filename)
             self.trainer.save_checkpoint(ckpt_path)
+        if self.global_step % self.conf.training.sample_train_imgs == 0:
+            sample = samples_fn(self.model, self.diffusion, img.shape, cond=cond)
+
+            cond_upsample = F.interpolate(cond, img.shape[-2:], mode='bilinear', align_corners=True)
+            grid = make_grid(torch.cat((img, cond_upsample, sample['samples']), dim=0),
+                             normalize=True,
+                             pad_value=0.5,
+                             nrow=8)
+            ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+            im = Image.fromarray(ndarr)
+            self.logger.experiment.log_image(im, name='train-img-step' + str(self.global_step),
+                                             step=self.global_step)
 
         return {'loss': loss}
 
@@ -171,8 +220,21 @@ class DDP(pl.LightningModule):
     def validation_step(self, batch, batch_nb):
 
         img, _ = batch
-        time   = (torch.rand(img.shape[0]) * 1000).type(torch.int64).to(img.device)
-        loss   = self.diffusion.training_losses(self.ema, img, time).mean()
+        time   = (torch.rand(img.shape[0]) * self.n_timesteps).type(torch.int64).to(img.device)
+        cond = F.interpolate(img, size=(16, 16), mode='area')
+        loss   = self.diffusion.training_losses(self.ema, img, time, cond=cond).mean()
+        if batch_nb == 0:
+            sample = samples_fn(self.ema, self.diffusion, img.shape, cond=cond)
+
+            cond_upsample = F.interpolate(cond, img.shape[-2:], mode='bilinear', align_corners=True)
+            grid = make_grid(torch.cat((img, cond_upsample, sample['samples']), dim=0),
+                                 normalize=True,
+                                 pad_value=0.5,
+                                 nrow=8)
+            ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+            im = Image.fromarray(ndarr)
+            self.logger.experiment.log_image(im, name='val-img-step' + str(self.global_step),
+                                             step=self.global_step)
 
         return {'val_loss': loss}
 
@@ -180,15 +242,6 @@ class DDP(pl.LightningModule):
 
         avg_loss         = torch.stack([x['val_loss'] for x in outputs]).mean()
         self.logger.log_metrics({"val_loss": avg_loss}, step=self.global_step)
-
-        shape  = (64, 3, self.conf.dataset.resolution, self.conf.dataset.resolution)
-        sample = progressive_samples_fn(self.ema, self.diffusion, shape, device='cuda' if self.on_gpu else 'cpu')
-
-        grid = make_grid(sample['samples'], nrow=8)
-        ndarr = grid.permute(1, 2, 0).to('cpu', torch.uint8).numpy()
-        im = Image.fromarray(ndarr)
-        self.logger.experiment.log_image(im, name='val-img-step' + str(self.global_step),
-                                         step=self.global_step)
         
         return {'val_loss': avg_loss}
 
@@ -204,12 +257,14 @@ class DDP(pl.LightningModule):
 
 if __name__ == "__main__":
 
-    '''parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", default=False, help="Training or evaluation?")
     parser.add_argument("--config", type=str, required=True, help="Path to config.")
 
     # Training specific args
-    parser.add_argument("--ckpt_dir", type=str, default='ckpts', help="Path to folder to save checkpoints.")
+    parser.add_argument("--exp_dir", type=str, default='ckpts', help="Path to folder to save checkpoints.")
+    parser.add_argument("--exp_name", type=str, default='test', help="name of experiment for comet log.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to model for loading.")
     parser.add_argument("--ckpt_freq", type=int, default=20, help="Frequency of saving the model (in epoch).")
     parser.add_argument("--n_gpu", type=int, default=1, help="Number of available GPUs.")
 
@@ -219,15 +274,15 @@ if __name__ == "__main__":
     parser.add_argument("--prog_sample_freq", type=int, default=200, help="Progressive sample frequency.")
     parser.add_argument("--n_samples", type=int, default=20, help="Number of generated samples in evaluation.")
 
-    args = parser.parse_args()'''
+    args = parser.parse_args()
 
-    class Args():
-        train = True
-        config = "config/diffusion_cifar10.json"
-        model_dir = None
-        exp_dir = "exp/cifa10/"
-        ckpt_freq = 20
-        n_gpu = 1
+    # class Args():
+    #     train = True
+    #     config = "config/diffusion_cifar10.json"
+    #     model_dir = None
+    #     exp_dir = "exp/cifa10/"
+    #     ckpt_freq = 20
+    #     n_gpu = 1
 
 
     '''class Args():
@@ -238,7 +293,7 @@ if __name__ == "__main__":
         prog_sample_freq = 200
         n_samples = 20'''
 
-    args = Args()
+    #args = Args()
 
     if not os.path.isdir(args.exp_dir):
         os.makedirs(args.exp_dir)
@@ -246,7 +301,6 @@ if __name__ == "__main__":
     path_to_config = args.config
     with open(path_to_config, 'r') as f:
         conf = json.load(f)
-
     conf = obj(conf)
     denoising_diffusion_model = DDP(conf, args.exp_dir)
 
@@ -263,14 +317,14 @@ if __name__ == "__main__":
             api_key="nGRMV8S1NSghQEh2WmxFb3ZnA",
             save_dir="logs/",  # Optional
             project_name="EECE570",  # Optional
-            experiment_name="test",  # Optional
+            experiment_name=args.exp_name,  # Optional
         )
 
         trainer = pl.Trainer(fast_dev_run=False,
                              gpus=args.n_gpu,
                              max_steps=conf.training.n_iter,
                              precision=conf.model.precision,
-                             gradient_clip_val=1.,
+                             #gradient_clip_val=1.,
                              enable_progress_bar=True,
                              enable_checkpointing=True,
                              check_val_every_n_epoch=conf.training.eval_every_epoch,
@@ -278,7 +332,7 @@ if __name__ == "__main__":
                              logger=comet_logger
                              )
 
-        trainer.fit(denoising_diffusion_model, ckpt_path=args.model_dir)
+        trainer.fit(denoising_diffusion_model, ckpt_path=args.resume)
 
     else:
         

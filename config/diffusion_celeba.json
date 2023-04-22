@@ -7,14 +7,14 @@
 }
 ,
 "model": {
-    "in_channel": 3,
+    "in_channel": 6,
     "channel": 128,
     "channel_multiplier": [1, 1, 2, 2, 4, 4],
     "n_res_blocks": 2,
     "attn_strides": [16],
     "mean_type": "eps",
     "var_type": "fixedlarge",
-    "loss_type": "kl",
+    "loss_type": "mse",
     "dropout": 0.0,
     "fold": 1,
     "schedule": {
@@ -28,10 +28,16 @@
 }
 ,
 "training": {
-    "n_iter" : 1000000,
+    "n_iter" : 4000000,
+    "n_anneal_steps": 5000,
+    "grad_clip_val": 1.0,
+    "log_loss_every_steps": 1000,
+    "retain_checkpoint_every_steps": 100000,
+    "sample_train_imgs": 10000,
+    "eval_every_epoch": 20,
     "optimizer": {
         "type": "adam",
-        "lr": 2e-4
+        "lr": 2e-5
     },
     "dataloader": {
         "batch_size": 16,

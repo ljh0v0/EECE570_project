@@ -119,34 +119,40 @@ class GaussianDiffusion(nn.Module):
                                            posterior_variance[1:].view(-1, 1)), 0)).view(-1))
         self.register("posterior_mean_coef1", (betas * torch.sqrt(alphas_cumprod_prev) / (1 - alphas_cumprod)))
         self.register("posterior_mean_coef2", ((1 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1 - alphas_cumprod)))
+        self.register("posterior_mean_coef3", (1-self.posterior_mean_coef2))
+        print("hi")
 
     def register(self, name, tensor):
         self.register_buffer(name, tensor.type(torch.float32))
 
-    def q_mean_variance(self, x_0, t):
-        mean = extract(self.sqrt_alphas_cumprod, t, x_0.shape) * x_0
+    def q_mean_variance(self, x_0, t, cond=None):
+        cond = 0 if cond is None else cond
+        mean = extract(self.sqrt_alphas_cumprod, t, x_0.shape) * x_0 + cond
         variance = extract(1. - self.alphas_cumprod, t, x_0.shape)
         log_variance = extract(self.log_one_minus_alphas_cumprod, t, x_0.shape)
         return mean, variance, log_variance
 
-    def q_sample(self, x_0, t, noise=None):
+    def q_sample(self, x_0, t, noise=None, cond=None):
+        cond = 0 if cond is None else cond
         if noise is None:
             noise = torch.randn_like(x_0)
 
-        return (extract(self.sqrt_alphas_cumprod, t, x_0.shape) * x_0
+        return (extract(self.sqrt_alphas_cumprod, t, x_0.shape) * x_0 + cond
                 + extract(self.sqrt_one_minus_alphas_cumprod, t, x_0.shape) * noise)
 
-    def q_posterior_mean_variance(self, x_0, x_t, t):
+    def q_posterior_mean_variance(self, x_0, x_t, t, cond=None):
+        cond = 0 if cond is None else cond
         mean            = (extract(self.posterior_mean_coef1, t, x_t.shape) * x_0
-                           + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t)
+                           + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+                          + extract(self.posterior_mean_coef3, t, x_t.shape) * cond)
         var             = extract(self.posterior_variance, t, x_t.shape)
         log_var_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
 
         return mean, var, log_var_clipped
 
-    def p_mean_variance(self, model, x, t, clip_denoised, return_pred_x0):
+    def p_mean_variance(self, model, x, t, clip_denoised, return_pred_x0, cond=None):
 
-        model_output = model(x, t)
+        model_output = model(x, t, cond)
 
         # Learned or fixed variance?
         if self.model_var_type == 'learned':
@@ -173,16 +179,16 @@ class GaussianDiffusion(nn.Module):
 
         if self.model_mean_type == 'xprev':
             # the model predicts x_{t-1}
-            pred_x_0 = _maybe_clip(self.predict_start_from_prev(x_t=x, t=t, x_prev=model_output))
+            pred_x_0 = _maybe_clip(self.predict_start_from_prev(x_t=x, t=t, x_prev=model_output, cond = cond))
             mean     = model_output
         elif self.model_mean_type == 'xstart':
             # the model predicts x_0
             pred_x0    = _maybe_clip(model_output)
-            mean, _, _ = self.q_posterior_mean_variance(x_0=pred_x0, x_t=x, t=t)
+            mean, _, _ = self.q_posterior_mean_variance(x_0=pred_x0, x_t=x, t=t, cond=cond)
         elif self.model_mean_type == 'eps':
             # the model predicts epsilon
-            pred_x0    = _maybe_clip(self.predict_start_from_noise(x_t=x, t=t, noise=model_output))
-            mean, _, _ = self.q_posterior_mean_variance(x_0=pred_x0, x_t=x, t=t)
+            pred_x0    = _maybe_clip(self.predict_start_from_noise(x_t=x, t=t, noise=model_output, cond=cond))
+            mean, _, _ = self.q_posterior_mean_variance(x_0=pred_x0, x_t=x, t=t, cond=cond)
         else:
             raise NotImplementedError(self.model_mean_type)
 
@@ -191,18 +197,21 @@ class GaussianDiffusion(nn.Module):
         else:
             return mean, var, log_var
 
-    def predict_start_from_noise(self, x_t, t, noise):
+    def predict_start_from_noise(self, x_t, t, noise, cond=None):
+        cond = 0 if cond is None else cond
         return (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+                - extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * cond
                 - extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise)
 
-    def predict_start_from_prev(self, x_t, t, x_prev):
-
+    def predict_start_from_prev(self, x_t, t, x_prev, cond=None):
+        cond = 0 if cond is None else cond
         return (extract(1./self.posterior_mean_coef1, t, x_t.shape) * x_prev -
-                extract(self.posterior_mean_coef2 / self.posterior_mean_coef1, t, x_t.shape) * x_t)
+                extract(self.posterior_mean_coef2 / self.posterior_mean_coef1, t, x_t.shape) * x_t -
+                extract(self.posterior_mean_coef3 / self.posterior_mean_coef1, t, x_t.shape) * cond)
 
-    def p_sample(self, model, x, t, noise_fn, clip_denoised=True, return_pred_x0=False):
+    def p_sample(self, model, x, t, noise_fn, clip_denoised=True, return_pred_x0=False, cond=None):
 
-        mean, _, log_var, pred_x0 = self.p_mean_variance(model, x, t, clip_denoised, return_pred_x0=True)
+        mean, _, log_var, pred_x0 = self.p_mean_variance(model, x, t, clip_denoised, return_pred_x0=True, cond=cond)
         noise                     = noise_fn(x.shape, dtype=x.dtype).to(x.device)
 
         shape        = [x.shape[0]] + [1] * (x.ndim - 1)
@@ -212,10 +221,11 @@ class GaussianDiffusion(nn.Module):
         return (sample, pred_x0) if return_pred_x0 else sample
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, noise_fn=torch.randn):
+    def p_sample_loop(self, model, shape, noise_fn=torch.randn, cond=None):
 
         device = 'cuda' if next(model.parameters()).is_cuda else 'cpu'
-        img    = noise_fn(shape).to(device)
+        cond = F.interpolate(cond, size=shape[-2:], mode='bilinear', align_corners=False) if cond is not None else 0
+        img    = cond + noise_fn(shape, dtype=torch.float32).to(device)
 
         for i in reversed(range(self.num_timesteps)):
             img = self.p_sample(
@@ -223,15 +233,16 @@ class GaussianDiffusion(nn.Module):
                 img,
                 torch.full((shape[0],), i, dtype=torch.int64).to(device),
                 noise_fn=noise_fn,
-                return_pred_x0=False
+                return_pred_x0=False,
+                cond=cond
             )
 
-        return img
+        return img-cond
 
     @torch.no_grad()
-    def p_sample_loop_progressive(self, model, shape, device, noise_fn=torch.randn, include_x0_pred_freq=50):
-
-        img = noise_fn(shape, dtype=torch.float32).to(device)
+    def p_sample_loop_progressive(self, model, shape, device, noise_fn=torch.randn, include_x0_pred_freq=50, cond=None):
+        cond = F.interpolate(cond, size=shape[-2:], mode='bilinear', align_corners=False) if cond is not None else 0
+        img = cond + noise_fn(shape, dtype=torch.float32).to(device)
 
         num_recorded_x0_pred = self.num_timesteps // include_x0_pred_freq
         x0_preds_            = torch.zeros((shape[0], num_recorded_x0_pred, *shape[1:]), dtype=torch.float32).to(device)
@@ -243,7 +254,8 @@ class GaussianDiffusion(nn.Module):
                                          x=img,
                                          t=torch.full((shape[0],), i, dtype=torch.int64).to(device),
                                          noise_fn=noise_fn,
-                                         return_pred_x0=True)
+                                         return_pred_x0=True,
+                                         cond=cond)
 
             # Keep track of prediction of x0
             insert_mask = np.floor(i // include_x0_pred_freq) == torch.arange(num_recorded_x0_pred,
@@ -257,17 +269,19 @@ class GaussianDiffusion(nn.Module):
 
     # === Log likelihood calculation ===
 
-    def _vb_terms_bpd(self, model, x_0, x_t, t, clip_denoised, return_pred_x0):
+    def _vb_terms_bpd(self, model, x_0, x_t, t, clip_denoised, return_pred_x0, cond=None,):
 
         batch_size = t.shape[0]
         true_mean, _, true_log_variance_clipped    = self.q_posterior_mean_variance(x_0=x_0,
                                                                                     x_t=x_t,
-                                                                                    t=t)
+                                                                                    t=t,
+                                                                                    cond=cond)
         model_mean, _, model_log_variance, pred_x0 = self.p_mean_variance(model,
                                                                           x=x_t,
                                                                           t=t,
                                                                           clip_denoised=clip_denoised,
-                                                                          return_pred_x0=True)
+                                                                          return_pred_x0=True,
+                                                                          cond=cond)
 
         kl = normal_kl(true_mean, true_log_variance_clipped, model_mean, model_log_variance)
         kl = torch.mean(kl.view(batch_size, -1), dim=1) / np.log(2.)
@@ -280,28 +294,29 @@ class GaussianDiffusion(nn.Module):
 
         return (output, pred_x0) if return_pred_x0 else output
 
-    def training_losses(self, model, x_0, t, noise=None):
+    def training_losses(self, model, x_0, t, noise=None, cond=None):
 
         if noise is None:
             noise = torch.randn_like(x_0)
 
-        x_t = self.q_sample(x_0=x_0, t=t, noise=noise)
+        cond = F.interpolate(cond, size=x_0.shape[-2:], mode='bilinear', align_corners=False) if cond is not None else 0
+        x_t = self.q_sample(x_0=x_0, t=t, noise=noise, cond=cond)
 
         # Calculate the loss
         if self.loss_type == 'kl':
             # the variational bound
-            losses = self._vb_terms_bpd(model=model, x_0=x_0, x_t=x_t, t=t, clip_denoised=False, return_pred_x0=False)
+            losses = self._vb_terms_bpd(model=model, x_0=x_0, x_t=x_t, t=t, clip_denoised=False, return_pred_x0=False, cond=cond)
 
         elif self.loss_type == 'mse':
             # unweighted MSE
             assert self.model_var_type != 'learned'
             target = {
-                'xprev': self.q_posterior_mean_variance(x_0=x_0, x_t=x_t, t=t)[0],
+                'xprev': self.q_posterior_mean_variance(x_0=x_0, x_t=x_t, t=t, cond=cond)[0],
                 'xstart': x_0,
                 'eps': noise
             }[self.model_mean_type]
 
-            model_output = model(x_t, t)
+            model_output = model(x_t, t, cond=cond)
             losses       = torch.mean((target - model_output).view(x_0.shape[0], -1)**2, dim=1)
 
         else:
@@ -309,11 +324,12 @@ class GaussianDiffusion(nn.Module):
 
         return losses
 
-    def _prior_bpd(self, x_0):
+    def _prior_bpd(self, x_0, cond=None):
 
         B, T                        = x_0.shape[0], self.num_timesteps
         qt_mean, _, qt_log_variance = self.q_mean_variance(x_0,
-                                                           t=torch.full((B,), T - 1, dtype=torch.int64))
+                                                           t=torch.full((B,), T - 1, dtype=torch.int64),
+                                                           cond=cond)
         kl_prior                    = normal_kl(mean1=qt_mean,
                                                 logvar1=qt_log_variance,
                                                 mean2=torch.zeros_like(qt_mean),
@@ -322,7 +338,7 @@ class GaussianDiffusion(nn.Module):
         return torch.mean(kl_prior.view(B, -1), dim=1)/np.log(2.)
 
     @torch.no_grad()
-    def calc_bpd_loop(self, model, x_0, clip_denoised):
+    def calc_bpd_loop(self, model, x_0, clip_denoised, cond=None):
 
         (B, C, H, W), T = x_0.shape, self.num_timesteps
 
@@ -336,10 +352,11 @@ class GaussianDiffusion(nn.Module):
             # Calculate VLB term at the current timestep
             new_vals_b, pred_x0 = self._vb_terms_bpd(model=model,
                                                      x_0=x_0,
-                                                     x_t=self.q_sample(x_0=x_0, t=t_b),
+                                                     x_t=self.q_sample(x_0=x_0, t=t_b, cond=cond),
                                                      t=t_b,
                                                      clip_denoised=clip_denoised,
-                                                     return_pred_x0=True)
+                                                     return_pred_x0=True,
+                                                     cond=cond)
 
             # MSE for progressive prediction loss
             new_mse_b = torch.mean((pred_x0-x_0).view(B, -1)**2, dim=1)
@@ -350,7 +367,7 @@ class GaussianDiffusion(nn.Module):
             new_vals_bt = new_vals_bt * (1. - mask_bt) + new_vals_b[:, None] * mask_bt
             new_mse_bt  = new_mse_bt  * (1. - mask_bt) + new_mse_b[:, None] * mask_bt
 
-        prior_bpd_b = self._prior_bpd(x_0)
+        prior_bpd_b = self._prior_bpd(x_0, cond=cond)
         total_bpd_b = torch.sum(new_vals_bt, dim=1) + prior_bpd_b
 
         return total_bpd_b, new_vals_bt, prior_bpd_b, new_mse_bt

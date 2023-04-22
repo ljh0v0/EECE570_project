@@ -6,21 +6,21 @@
 }
 ,
 "model": {
-    "in_channel": 3,
+    "in_channel": 6,
     "channel": 128,
     "channel_multiplier": [1, 2, 2, 2],
     "n_res_blocks": 2,
     "attn_strides": [16],
     "mean_type": "eps",
     "var_type": "fixedlarge",
-    "loss_type": "kl",
+    "loss_type": "mse",
     "dropout": 0.1,
     "fold": 1,
     "schedule": {
         "type": "linear",
         "beta_start": 1e-4,
         "beta_end": 2e-2,
-        "n_timestep": 1000
+        "n_timestep": 100
     },
     "device": "cuda",
     "precision": 32
@@ -28,15 +28,18 @@
 ,
 "training": {
     "n_iter" : 1500000,
+    "n_anneal_steps": 5000,
+    "grad_clip_val": 1.0,
     "log_loss_every_steps": 1000,
-    "retain_checkpoint_every_steps": 10000,
-    "eval_every_epoch": 50,
+    "retain_checkpoint_every_steps": 100000,
+    "sample_train_imgs": 5000,
+    "eval_every_epoch": 20,
     "optimizer": {
         "type": "adam",
         "lr": 2e-4
     },
     "dataloader": {
-        "batch_size": 4,
+        "batch_size": 2,
         "num_workers": 4,
         "drop_last": true
     }
@@ -44,7 +47,7 @@
 ,
 "validation": {
     "dataloader": {
-        "batch_size": 4,
+        "batch_size": 2,
         "num_workers": 4,
         "drop_last": false
     }

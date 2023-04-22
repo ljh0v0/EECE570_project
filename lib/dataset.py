@@ -3,6 +3,7 @@ import torchvision.transforms as T
 import torchvision.datasets
 import numpy as np
 from torch.utils.data import Subset
+DEBUG = False
 
 class ReshapeTransform:
     def __init__(self, new_size):
@@ -41,18 +42,15 @@ def get_train_data(conf):
                                                  transform=transform,
                                                  download=True)
         valid_set = torchvision.datasets.CIFAR10(conf.dataset.path,
-                                                  train=True,
-                                                  transform=transform_test,
-                                                  download=True)
+                                                train=False,
+                                                transform=transform_test,
+                                                download=True)
 
-        num_train  = len(train_set)
-        indices    = torch.randperm(num_train).tolist()
-        valid_size = int(np.floor(0.05 * num_train))
-
-        train_idx, valid_idx = indices[valid_size:], indices[:valid_size]
-
-        train_set = Subset(train_set, train_idx)
-        valid_set = Subset(valid_set, valid_idx)
+        if DEBUG:
+            # limit_size = list(range(min(len(train_set), conf.training.dataloader.batch_size*10+1000)))
+            limit_size = list(range(128))
+            train_set = Subset(train_set, limit_size)
+            valid_set = Subset(valid_set, limit_size)
 
     elif conf.dataset.name == 'svhn':
         transform = T.Compose(
@@ -104,23 +102,23 @@ def get_train_data(conf):
                 T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
             ]
         )
-        transform = T.Compose(
-            [
-                T.CenterCrop(148),
-                T.Resize(64),
-                T.RandomHorizontalFlip(),
-                T.ToTensor(),
-                T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
-        transform_test = T.Compose(
-            [
-                T.CenterCrop(148),
-                T.Resize(64),
-                T.ToTensor(),
-                T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-            ]
-        )
+        # transform = T.Compose(
+        #     [
+        #         T.CenterCrop(148),
+        #         T.Resize(64),
+        #         T.RandomHorizontalFlip(),
+        #         T.ToTensor(),
+        #         T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+        #     ]
+        # )
+        # transform_test = T.Compose(
+        #     [
+        #         T.CenterCrop(148),
+        #         T.Resize(64),
+        #         T.ToTensor(),
+        #         T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+        #     ]
+        # )
 
         train_set = torchvision.datasets.CelebA(conf.dataset.path,
                                                 split='train',
